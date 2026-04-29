@@ -1,0 +1,17 @@
+{
+  "slug": "gp-agentic-revenue-ops",
+  "publicTitle": "Agentic Marketing Operations Workbench",
+  "targetCompany": "Globalization Partners (G-P)",
+  "targetRole": "Marketing AI Agent Builder",
+  "sourceJob": "JD provided directly by candidate (April 2026)",
+  "archetype": "workflow-automation-copilot",
+  "status": "deployed",
+  "latestDeployId": "69f0f1b4659795d22428974a",
+  "routes": ["/", "/api/health", "/api/agent-run"],
+  "netlifySite": "ec7e2da1-fae0-4e91-bb94-b99e1b773308",
+  "productionUrl": "https://gp-agentic-revenue-ops.netlify.app",
+  "previewPolicy": "public-safe-synthetic-data",
+  "dataPolicy": "synthetic-only",
+  "packageMode": "resume-and-interview",
+  "disclaimer": "Independent concept demo. Not affiliated with or endorsed by Globalization Partners (G-P). All data is synthetic."
+}
