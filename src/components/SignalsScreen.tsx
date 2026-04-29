@@ -134,6 +134,56 @@ export function SignalsScreen({
               {liveProgress ? ` ${liveProgress}` : ''}
             </p>
           )}
+          <details
+            style={{
+              marginTop: 8,
+              padding: '8px 10px',
+              border: '1px solid var(--line)',
+              borderRadius: 4,
+              background: 'var(--bg-2)',
+              maxWidth: 720,
+            }}
+          >
+            <summary style={{ fontSize: 12, fontWeight: 600, cursor: 'pointer', listStyle: 'none' }}>
+              <Icon name="info" size={12} /> How to use this — click to expand
+            </summary>
+            <ol
+              style={{
+                margin: '8px 0 0 18px',
+                padding: 0,
+                fontSize: 11.5,
+                lineHeight: 1.55,
+                color: 'var(--ink-2)',
+              }}
+            >
+              <li>
+                <strong>What you're looking at:</strong> 4 real, named mid-market companies
+                expanding internationally, fetched live from the public web (LinkedIn, press,
+                investor letters, regulator portals) via GLM-5.1 + web_search and cached in Netlify
+                Blobs. No fixtures, no demo data.
+              </li>
+              <li>
+                <strong>Click any row</strong> → opens the Agent Run with a 7-step reasoning
+                timeline (Plan → Enrich → ICP Score → RAG → Draft → Critique → HITL Gate) running
+                on that real signal.
+              </li>
+              <li>
+                <strong>Click the coral "Refresh" button (top right)</strong> → re-pulls fresh real
+                signals from the public web (~30s, streamed) and updates the cache. Subsequent
+                page loads are instant from the cache.
+              </li>
+              <li>
+                <strong>Filter</strong> by signal type (HIRING / FUNDING / EXPANSION /
+                EXEC-HIRE / COMPLIANCE) or ICP fit floor (≥55, ≥75, ≥85). Search by company,
+                country, or signal id.
+              </li>
+              <li>
+                <strong>Open the "Demo Guide" sidebar tab</strong> for the full walkthrough,
+                business requirement, real-world application context, and 90s/5min/15min talk
+                tracks.
+              </li>
+            </ol>
+          </details>
         </div>
         <button
           className="btn btn--sm btn--primary"

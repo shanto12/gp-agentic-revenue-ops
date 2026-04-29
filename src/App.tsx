@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Shell, type ScreenName } from './components/Shell'
 import { SignalsScreen } from './components/SignalsScreen'
 import { AgentRunScreen } from './components/AgentRunScreen'
+import type {
+  ParallelAgentRunState,
+  ParallelSubagentSnapshot,
+  ParallelVariantId,
+} from './components/AgentRunScreen'
 import { CampaignsScreen } from './components/CampaignsScreen'
 import { ArchitectureScreen } from './components/ArchitectureScreen'
 import { AuditScreen } from './components/AuditScreen'
@@ -40,6 +45,32 @@ interface LiveSignalsPayload {
 
 type View = ScreenName | 'agent-run'
 
+const PARALLEL_SUBAGENT_IDS = [
+  'research-enricher',
+  'draft-compliance',
+  'draft-talent',
+  'draft-speed',
+] as const
+
+function emptyParallelState(): ParallelAgentRunState {
+  const subagents: Record<string, ParallelSubagentSnapshot> = {}
+  for (const id of PARALLEL_SUBAGENT_IDS) {
+    subagents[id] = { id, status: 'queued', latencyMs: null }
+  }
+  return {
+    status: 'idle',
+    subagents,
+    consolidator: null,
+    winner: null,
+    drafts: { compliance: null, talent: null, speed: null },
+    research: null,
+    totalLatencyMs: null,
+    totalUsage: null,
+    webSearchHitCount: 0,
+    error: null,
+  }
+}
+
 export default function App() {
   const [view, setView] = useState<View>('signals')
   const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null)
@@ -52,14 +83,16 @@ export default function App() {
   })
   const [paused, setPaused] = useState(false)
   const [liveModeAvailable, setLiveModeAvailable] = useState(false)
-  const [liveLoading, setLiveLoading] = useState(false)
-  const [liveError, setLiveError] = useState<string | null>(null)
+  const [parallel, setParallel] = useState<ParallelAgentRunState>(() => emptyParallelState())
   const [webSearchHits, setWebSearchHits] = useState<WebSearchHit[]>([])
   const [researchLoading, setResearchLoading] = useState(false)
   const [researchError, setResearchError] = useState<string | null>(null)
   const [researchResult, setResearchResult] = useState<ResearchResult | null>(null)
   const [extraAudit, setExtraAudit] = useState<AuditEntry[]>([])
   const [utc, setUtc] = useState(() => new Date().toISOString().slice(11, 19))
+  // Quota counters — visible in the topbar so the user can see real GLM usage.
+  const [glmCallCount, setGlmCallCount] = useState(0)
+  const [webSearchTotal, setWebSearchTotal] = useState(0)
   // Real public-web data is the only display mode. Fixtures are kept ONLY as
   // a last-resort fallback if both /api/cached-signals and /api/refresh-signals
   // fail (e.g. GLM_API_KEY unset on the deployed env).
@@ -73,6 +106,7 @@ export default function App() {
 
   const activeSignals: Signal[] = liveSignals ?? fixtureSignals
   const activeCompanies: Company[] = liveCompanies ?? fixtureCompanies
+  const parallelAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     const id = setInterval(() => setUtc(new Date().toISOString().slice(11, 19)), 1000)
@@ -93,13 +127,210 @@ export default function App() {
     }
   }, [])
 
+  const runParallelAgents = useCallback(
+    async (sig: Signal) => {
+      const company = activeCompanies.find((c) => c.id === sig.companyId)
+      if (!company) return
+      // Abort any in-flight parallel run for the previous signal.
+      if (parallelAbortRef.current) parallelAbortRef.current.abort()
+      const ac = new AbortController()
+      parallelAbortRef.current = ac
+
+      const fresh = emptyParallelState()
+      fresh.status = 'streaming'
+      // mark all four as running so the panel ticks immediately
+      for (const id of PARALLEL_SUBAGENT_IDS) {
+        fresh.subagents[id] = { id, status: 'running', latencyMs: null, startedAt: Date.now() }
+      }
+      setParallel(fresh)
+
+      const ragHits = retrieve(
+        `${sig.headline} ${sig.detail} ${company.industry} ${sig.countryFocus}`,
+        { topK: 3 },
+      ).map((h) => ({
+        docId: h.doc.id,
+        kind: h.doc.kind,
+        title: h.doc.title,
+        excerpt: h.excerpt,
+      }))
+
+      try {
+        const res = await fetch('/api/agent-run', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            signal: sig,
+            company,
+            ragHits,
+            brandVoiceMarkdown: brandVoiceDoc.bodyMarkdown,
+            icpBand: 'high',
+          }),
+          signal: ac.signal,
+        })
+        if (!res.ok || !res.body) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body.error ?? `parallel run failed (${res.status})`)
+        }
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        const handle = (event: string, data: unknown) => {
+          if (event === 'start') {
+            // 4 GLM calls planned + 1 consolidator (we count on landing).
+          } else if (event === 'subagent') {
+            const d = data as {
+              id: string
+              status: 'ok' | 'error'
+              latencyMs: number
+              payload?: unknown
+              error?: string
+              usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null
+              webSearchHitCount?: number
+              webSearchHits?: WebSearchHit[]
+            }
+            setParallel((prev) => {
+              const next: ParallelAgentRunState = {
+                ...prev,
+                subagents: {
+                  ...prev.subagents,
+                  [d.id]: {
+                    id: d.id,
+                    status: d.status,
+                    latencyMs: d.latencyMs,
+                    payload: d.payload,
+                    error: d.error,
+                    usage: d.usage ?? null,
+                    webSearchHitCount: d.webSearchHitCount ?? 0,
+                  },
+                },
+              }
+              if (d.status === 'ok' && d.id === 'research-enricher') {
+                next.research = (d.payload ?? null) as ParallelAgentRunState['research']
+              }
+              if (d.status === 'ok' && d.id.startsWith('draft-')) {
+                const variant = d.id.replace('draft-', '') as ParallelVariantId
+                next.drafts = {
+                  ...next.drafts,
+                  [variant]: (d.payload ?? null) as NurtureSequence | null,
+                }
+              }
+              return next
+            })
+            setGlmCallCount((n) => n + 1)
+            if (d.status === 'ok' && d.webSearchHits && d.webSearchHits.length) {
+              setWebSearchHits((prev) => [...prev, ...d.webSearchHits!])
+              setWebSearchTotal((n) => n + d.webSearchHits!.length)
+            }
+          } else if (event === 'consolidating') {
+            setParallel((prev) => ({ ...prev, consolidator: { status: 'running' } }))
+          } else if (event === 'consolidator') {
+            const d = data as {
+              winnerVariant: ParallelVariantId | null
+              evaluatorScores: ParallelAgentRunState['evaluatorScores']
+              rationale: string | null
+              latencyMs: number
+              error?: string
+            }
+            setParallel((prev) => ({
+              ...prev,
+              consolidator: {
+                status: d.error ? 'error' : 'ok',
+                latencyMs: d.latencyMs,
+                rationale: d.rationale,
+                evaluatorScores: d.evaluatorScores as ParallelAgentRunState['evaluatorScores'],
+                error: d.error,
+              },
+              winner: d.winnerVariant,
+              evaluatorScores: d.evaluatorScores as ParallelAgentRunState['evaluatorScores'],
+            }))
+            setGlmCallCount((n) => n + 1)
+          } else if (event === 'result') {
+            const d = data as {
+              drafts: ParallelAgentRunState['drafts']
+              research: ParallelAgentRunState['research']
+              winner: {
+                variant: ParallelVariantId
+                draft: NurtureSequence | null
+              } | null
+              totalLatencyMs: number
+              totalUsage: ParallelAgentRunState['totalUsage']
+              webSearchHitCount: number
+            }
+            setParallel((prev) => ({
+              ...prev,
+              status: 'done',
+              drafts: d.drafts,
+              research: d.research,
+              winner: d.winner?.variant ?? prev.winner,
+              totalLatencyMs: d.totalLatencyMs,
+              totalUsage: d.totalUsage,
+              webSearchHitCount: d.webSearchHitCount,
+            }))
+            // Replace the deterministic draft step output with the winner.
+            if (d.winner?.draft) {
+              setCurrentRun((prevRun) => {
+                if (!prevRun || prevRun.signalId !== sig.id) return prevRun
+                const refreshed = buildSyntheticRun({
+                  signal: sig,
+                  modelMode: 'live-claude',
+                  liveDraft: d.winner!.draft!,
+                  companies: activeCompanies,
+                })
+                return refreshed
+              })
+            }
+          } else if (event === 'error') {
+            const d = data as { message?: string }
+            setParallel((prev) => ({
+              ...prev,
+              status: 'error',
+              error: d.message ?? 'unknown error',
+            }))
+          }
+        }
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const messages = buffer.split('\n\n')
+          buffer = messages.pop() ?? ''
+          for (const msg of messages) {
+            if (!msg.trim() || msg.startsWith(':')) continue
+            const lines = msg.split('\n')
+            let event = 'message'
+            let dataStr = ''
+            for (const line of lines) {
+              if (line.startsWith('event: ')) event = line.slice(7).trim()
+              else if (line.startsWith('data: ')) dataStr += line.slice(6)
+            }
+            if (!dataStr) continue
+            let data: unknown
+            try {
+              data = JSON.parse(dataStr)
+            } catch {
+              continue
+            }
+            handle(event, data)
+          }
+        }
+      } catch (err) {
+        if ((err as { name?: string }).name === 'AbortError') return
+        const message = err instanceof Error ? err.message : 'unknown error'
+        setParallel((prev) => ({ ...prev, status: 'error', error: message }))
+      }
+    },
+    [activeCompanies],
+  )
+
   const onSelectSignal = useCallback(
     (sig: Signal) => {
       setSelectedSignal(sig)
-      setLiveError(null)
       setWebSearchHits([])
       setResearchResult(null)
       setResearchError(null)
+      setParallel(emptyParallelState())
       const run = buildSyntheticRun({
         signal: sig,
         modelMode: 'synthetic-deterministic',
@@ -108,8 +339,14 @@ export default function App() {
       setCurrentRun(run)
       setRowStatus((prev) => ({ ...prev, [sig.id]: run.status }))
       setView('agent-run')
+      // Auto-fire the parallel run on signal click — the user does not need
+      // to push a button. Skip in synthetic-only environments where there's
+      // no GLM key on the server.
+      if (liveModeAvailable) {
+        void runParallelAgents(sig)
+      }
     },
-    [activeCompanies],
+    [activeCompanies, liveModeAvailable, runParallelAgents],
   )
 
   const refreshSignals = useCallback(async () => {
@@ -284,99 +521,10 @@ export default function App() {
     ])
   }, [currentRun, selectedSignal])
 
-  const onRunLive = useCallback(async () => {
-    if (!selectedSignal || !currentRun) return
-    setLiveLoading(true)
-    setLiveError(null)
-    try {
-      const company = activeCompanies.find((c) => c.id === selectedSignal.companyId)
-      if (!company) throw new Error('company not found in active dataset')
-      const ragHits = retrieve(
-        `${selectedSignal.headline} ${selectedSignal.detail} ${company.industry} ${selectedSignal.countryFocus}`,
-        { topK: 3 },
-      ).map((h) => ({
-        docId: h.doc.id,
-        kind: h.doc.kind,
-        title: h.doc.title,
-        excerpt: h.excerpt,
-      }))
-      const res = await fetch('/api/agent-run', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          signal: selectedSignal,
-          company,
-          ragHits,
-          brandVoiceMarkdown: brandVoiceDoc.bodyMarkdown,
-          icpBand: 'high',
-        }),
-      })
-      if (!res.ok || !res.body) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? `live mode failed (${res.status})`)
-      }
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      let resolvedDraft: NurtureSequence | null = null
-      let resolvedHits: WebSearchHit[] = []
-      let resolvedError: string | null = null
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const messages = buffer.split('\n\n')
-        buffer = messages.pop() ?? ''
-        for (const msg of messages) {
-          if (!msg.trim() || msg.startsWith(':')) continue
-          const lines = msg.split('\n')
-          let event = 'message'
-          let dataStr = ''
-          for (const line of lines) {
-            if (line.startsWith('event: ')) event = line.slice(7).trim()
-            else if (line.startsWith('data: ')) dataStr += line.slice(6)
-          }
-          if (!dataStr) continue
-          let data: unknown
-          try {
-            data = JSON.parse(dataStr)
-          } catch {
-            continue
-          }
-          if (event === 'result') {
-            const r = data as {
-              draft: NurtureSequence
-              webSearchHits?: WebSearchHit[]
-            }
-            resolvedDraft = r.draft
-            resolvedHits = r.webSearchHits ?? []
-          } else if (event === 'error') {
-            const e = data as { message?: string }
-            resolvedError = e.message ?? 'unknown error'
-          }
-        }
-      }
-
-      if (resolvedError) throw new Error(resolvedError)
-      if (!resolvedDraft) throw new Error('no draft returned')
-
-      const refreshed = buildSyntheticRun({
-        signal: selectedSignal,
-        modelMode: 'live-claude',
-        liveDraft: resolvedDraft,
-        companies: activeCompanies,
-      })
-      setCurrentRun(refreshed)
-      setWebSearchHits(resolvedHits)
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'unknown error'
-      setLiveError(message)
-    } finally {
-      setLiveLoading(false)
-    }
-  }, [selectedSignal, currentRun, activeCompanies])
+  const onRerunParallel = useCallback(() => {
+    if (!selectedSignal) return
+    void runParallelAgents(selectedSignal)
+  }, [selectedSignal, runParallelAgents])
 
   const onRunResearch = useCallback(async () => {
     if (!selectedSignal) return
@@ -497,11 +645,23 @@ export default function App() {
     )
   }, [view, selectedSignal, activeCompanies])
 
-  const rightExtras = view === 'signals' && (
-    <button className="btn btn--sm" type="button" aria-label="Connector status">
-      <Icon name="info" size={11} />
-      <span style={{ fontSize: 11.5 }}>2 signals new</span>
-    </button>
+  const rightExtras = (
+    <>
+      {view === 'signals' && (
+        <button className="btn btn--sm" type="button" aria-label="Connector status">
+          <Icon name="info" size={11} />
+          <span style={{ fontSize: 11.5 }}>2 signals new</span>
+        </button>
+      )}
+      <span
+        className="tb__chip mono"
+        title="Live GLM-5.1 calls and web_search hits captured this session"
+        style={{ fontSize: 11.5 }}
+      >
+        <Icon name="sparkle" size={11} />
+        GLM {glmCallCount} · web {webSearchTotal}
+      </span>
+    </>
   )
 
   return (
@@ -558,9 +718,8 @@ export default function App() {
               onReject={onReject}
               onBack={() => setView('signals')}
               liveModeAvailable={liveModeAvailable}
-              onRunLive={onRunLive}
-              liveError={liveError}
-              liveLoading={liveLoading}
+              onRerunParallel={onRerunParallel}
+              parallel={parallel}
               webSearchHits={webSearchHits}
               researchAvailable={liveModeAvailable}
               onRunResearch={onRunResearch}

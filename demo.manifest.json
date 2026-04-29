@@ -10,6 +10,7 @@
   "routes": ["/", "/api/health", "/api/agent-run"],
   "netlifySite": "ec7e2da1-fae0-4e91-bb94-b99e1b773308",
   "productionUrl": "https://gp-agentic-revenue-ops.netlify.app",
+  "repoUrl": "https://github.com/shanto12/gp-agentic-revenue-ops",
   "previewPolicy": "public-safe-synthetic-data",
   "dataPolicy": "synthetic-only",
   "packageMode": "resume-and-interview",

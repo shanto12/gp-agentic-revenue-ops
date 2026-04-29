@@ -70,7 +70,8 @@ export function Shell({
           </nav>
           <div className="sb__foot">
             <strong>Independent demo</strong>
-            Synthetic data only. Server-side AI boundary. No PII ingested.
+            Real public-web data via GLM-5.1 + web_search. Server-side AI boundary. No PII
+            ingested.
           </div>
         </div>
       </aside>
@@ -100,7 +101,8 @@ export function Shell({
         <div className="main">{children}</div>
         <footer className="footer">
           Independent concept demo. Not affiliated with or endorsed by Globalization Partners
-          (G-P). All data is synthetic.
+          (G-P). Buyer-intent signals fetched live from public sources via GLM-5.1 + web_search;
+          synthetic fixtures only as a last-resort fallback.
         </footer>
       </main>
     </div>

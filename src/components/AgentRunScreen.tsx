@@ -1,9 +1,73 @@
-import { useMemo, useState } from 'react'
-import type { AgentRun, AgentStep, Company, Signal, StepName } from '../lib/types'
+import { useEffect, useMemo, useState } from 'react'
+import type {
+  AgentRun,
+  AgentStep,
+  Company,
+  NurtureSequence,
+  Signal,
+  StepName,
+} from '../lib/types'
 import { Icon } from './Icon'
 import { Gauge, JsonView, ModelChip, ScoreChip, StatusBadge, TypeTag } from './Primitives'
 import { formatLatency, formatTokens, formatTimeAgo } from '../lib/format'
 import { DeepResearchPanel, type ResearchResult } from './DeepResearchPanel'
+
+export type ParallelVariantId = 'compliance' | 'talent' | 'speed'
+
+export interface ParallelSubagentSnapshot {
+  id: string
+  status: 'queued' | 'running' | 'ok' | 'error'
+  latencyMs: number | null
+  startedAt?: number
+  payload?: unknown
+  error?: string
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null
+  webSearchHitCount?: number
+}
+
+export interface ParallelEvaluatorScores {
+  brandVoiceFit: number
+  hallucinationRisk: number
+  icpConfidence: number
+  flagged: string[]
+}
+
+export interface ParallelAgentRunState {
+  status: 'idle' | 'streaming' | 'done' | 'error'
+  subagents: Record<string, ParallelSubagentSnapshot>
+  consolidator: {
+    status: 'running' | 'ok' | 'error'
+    latencyMs?: number
+    rationale?: string | null
+    evaluatorScores?: Record<ParallelVariantId, ParallelEvaluatorScores> | null
+    error?: string
+  } | null
+  winner: ParallelVariantId | null
+  evaluatorScores?: Record<ParallelVariantId, ParallelEvaluatorScores> | null
+  drafts: Record<ParallelVariantId, NurtureSequence | null>
+  research: {
+    keyFacts?: string[]
+    publicEvidence?: Array<{ title: string; link: string; publishDate: string | null }>
+    confidence?: number
+  } | null
+  totalLatencyMs: number | null
+  totalUsage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null
+  webSearchHitCount: number
+  error: string | null
+}
+
+const SUBAGENT_LABELS: Record<string, string> = {
+  'research-enricher': 'Research enricher (web)',
+  'draft-compliance': 'Draft · compliance lens',
+  'draft-talent': 'Draft · talent lens',
+  'draft-speed': 'Draft · speed lens',
+}
+
+const VARIANT_LABELS: Record<ParallelVariantId, string> = {
+  compliance: 'Compliance',
+  talent: 'Talent',
+  speed: 'Speed-to-market',
+}
 
 interface Props {
   run: AgentRun
@@ -13,9 +77,8 @@ interface Props {
   onReject: () => void
   onBack: () => void
   liveModeAvailable: boolean
-  onRunLive: () => void
-  liveError?: string | null
-  liveLoading?: boolean
+  onRerunParallel: () => void
+  parallel: ParallelAgentRunState
   webSearchHits?: Array<{
     title: string
     link: string
@@ -38,9 +101,8 @@ export function AgentRunScreen({
   onReject,
   onBack,
   liveModeAvailable,
-  onRunLive,
-  liveError,
-  liveLoading,
+  onRerunParallel,
+  parallel,
   webSearchHits,
   researchAvailable,
   onRunResearch,
@@ -51,6 +113,21 @@ export function AgentRunScreen({
   const [openStep, setOpenStep] = useState<StepName | null>('draft_nurture')
 
   const decision = run.status
+
+  const winnerDraft: NurtureSequence | null = useMemo(() => {
+    if (!parallel.winner) return null
+    return parallel.drafts[parallel.winner] ?? null
+  }, [parallel.winner, parallel.drafts])
+
+  const effectiveDraft: NurtureSequence | null = winnerDraft ?? run.draftNurture
+  const effectiveWriteback = run.writeback
+
+  const effectiveScores = useMemo(() => {
+    if (parallel.winner && parallel.evaluatorScores?.[parallel.winner]) {
+      return parallel.evaluatorScores[parallel.winner]
+    }
+    return run.scores
+  }, [parallel.winner, parallel.evaluatorScores, run.scores])
 
   const totalsRow = useMemo(
     () => (
@@ -65,9 +142,18 @@ export function AgentRunScreen({
         <dd className="mono">${run.estCostUsd.toFixed(4)}</dd>
         <dt>Mode</dt>
         <dd className="mono">{run.modelMode}</dd>
+        {parallel.totalLatencyMs != null && (
+          <>
+            <dt>Parallel run</dt>
+            <dd className="mono">
+              {formatLatency(parallel.totalLatencyMs)} ·{' '}
+              {parallel.totalUsage?.total_tokens ?? 0}t · {parallel.webSearchHitCount} web hits
+            </dd>
+          </>
+        )}
       </div>
     ),
-    [run],
+    [run, parallel],
   )
 
   return (
@@ -160,18 +246,19 @@ export function AgentRunScreen({
           {liveModeAvailable && (
             <button
               className="btn btn--sm"
-              onClick={onRunLive}
-              disabled={liveLoading}
-              aria-label="Re-run draft step against live Claude"
+              onClick={onRerunParallel}
+              disabled={parallel.status === 'streaming'}
+              aria-label="Re-run parallel agents"
             >
-              <Icon name="sparkle" size={11} /> {liveLoading ? 'Drafting…' : 'Re-run draft live'}
+              <Icon name="sparkle" size={11} />
+              {parallel.status === 'streaming' ? 'Running…' : 'Re-run parallel agents'}
             </button>
           )}
         </header>
-        {liveError && (
+        {parallel.error && (
           <div role="alert" className="card" style={{ borderColor: 'var(--red)' }}>
             <div className="card__body" style={{ color: 'var(--red)', fontSize: 12 }}>
-              <Icon name="alert" size={12} /> {liveError}
+              <Icon name="alert" size={12} /> {parallel.error}
             </div>
           </div>
         )}
@@ -186,6 +273,9 @@ export function AgentRunScreen({
             />
           ))}
         </div>
+
+        <ParallelSubagentPanel parallel={parallel} />
+        <RecommendedDraftCard parallel={parallel} />
 
         {webSearchHits && webSearchHits.length > 0 && (
           <section className="card">
@@ -248,37 +338,77 @@ export function AgentRunScreen({
         <div className="card">
           <div className="card__head">
             <span className="sec-title">Evaluator scores</span>
+            {parallel.winner && (
+              <>
+                <span className="tb__spacer" />
+                <span className="kbd">winner: {VARIANT_LABELS[parallel.winner]}</span>
+              </>
+            )}
           </div>
           <div className="card__body">
-            <Gauge label="Brand-voice fit" value={run.scores.brandVoiceFit} tone="good" />
+            <Gauge label="Brand-voice fit" value={effectiveScores.brandVoiceFit} tone="good" />
             <Gauge
               label="Hallucination risk"
-              value={run.scores.hallucinationRisk}
-              tone={run.scores.hallucinationRisk > 25 ? 'bad' : 'good'}
+              value={effectiveScores.hallucinationRisk}
+              tone={effectiveScores.hallucinationRisk > 25 ? 'bad' : 'good'}
               invert
             />
             <Gauge
               label="ICP confidence"
-              value={run.scores.icpConfidence}
-              tone={run.scores.icpConfidence >= 70 ? 'good' : 'warn'}
+              value={effectiveScores.icpConfidence}
+              tone={effectiveScores.icpConfidence >= 70 ? 'good' : 'warn'}
             />
-            {run.scores.flagged.length > 0 && (
+            {effectiveScores.flagged && effectiveScores.flagged.length > 0 && (
               <p style={{ fontSize: 11, color: 'var(--red)', margin: '6px 0 0' }}>
-                <Icon name="alert" size={11} /> Flagged terms: {run.scores.flagged.join(', ')}
+                <Icon name="alert" size={11} /> Flagged terms: {effectiveScores.flagged.join(', ')}
               </p>
             )}
           </div>
         </div>
 
+        {effectiveDraft && (
+          <div className="card" style={{ marginTop: 12 }}>
+            <div className="card__head">
+              <span className="sec-title">Recommended draft</span>
+              {parallel.winner && (
+                <>
+                  <span className="tb__spacer" />
+                  <span className="kbd">{VARIANT_LABELS[parallel.winner]}</span>
+                </>
+              )}
+            </div>
+            <div className="card__body">
+              <p style={{ fontSize: 11.5, color: 'var(--muted)', margin: 0 }}>
+                {effectiveDraft.rationale}
+              </p>
+              <details style={{ marginTop: 8 }}>
+                <summary style={{ fontSize: 12, cursor: 'pointer' }}>
+                  Step 1 body preview
+                </summary>
+                <p
+                  style={{
+                    fontSize: 12,
+                    color: 'var(--ink-2)',
+                    margin: '6px 0 0',
+                    whiteSpace: 'pre-wrap',
+                  }}
+                >
+                  {effectiveDraft.steps[0]?.body ?? '(empty)'}
+                </p>
+              </details>
+            </div>
+          </div>
+        )}
+
         <div className="card" style={{ marginTop: 12 }}>
           <div className="card__head">
             <span className="sec-title">Proposed CRM write-back</span>
             <span className="tb__spacer" />
-            <span className="kbd">{run.writeback?.object}</span>
+            <span className="kbd">{effectiveWriteback?.object}</span>
           </div>
           <div className="card__body">
             <div className="diff">
-              {run.writeback?.diff.map((d) => (
+              {effectiveWriteback?.diff.map((d) => (
                 <div key={d.field}>
                   <div className="diff__line diff__line--del">
                     <span className="diff__sigil">-</span>
@@ -296,8 +426,9 @@ export function AgentRunScreen({
               ))}
             </div>
             <p style={{ fontSize: 11, color: 'var(--muted)', marginTop: 8 }}>
-              Diff against synthetic CRM record <span className="kbd">{run.writeback?.recordId}</span>.
-              Nothing is sent until you approve.
+              Diff against synthetic CRM record{' '}
+              <span className="kbd">{effectiveWriteback?.recordId}</span>. Nothing is sent until
+              you approve.
             </p>
           </div>
         </div>
@@ -319,6 +450,232 @@ export function AgentRunScreen({
         </div>
       </aside>
     </div>
+  )
+}
+
+function ParallelSubagentPanel({ parallel }: { parallel: ParallelAgentRunState }) {
+  const [open, setOpen] = useState<string | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+
+  // tick to drive live latency for running cards
+  useEffect(() => {
+    const anyRunning = Object.values(parallel.subagents).some((s) => s.status === 'running')
+    if (!anyRunning) return
+    const id = setInterval(() => setNow(Date.now()), 200)
+    return () => clearInterval(id)
+  }, [parallel.subagents])
+
+  const order = ['research-enricher', 'draft-compliance', 'draft-talent', 'draft-speed']
+
+  return (
+    <section className="card" aria-label="Parallel subagents">
+      <div className="card__head">
+        <Icon name="branch" size={13} />
+        <span className="card__title">Parallel subagents (GLM-5.1 + web_search)</span>
+        <span className="tb__spacer" />
+        {parallel.status === 'streaming' && (
+          <span className="kbd">streaming…</span>
+        )}
+        {parallel.status === 'done' && parallel.totalLatencyMs != null && (
+          <span className="kbd mono">
+            {formatLatency(parallel.totalLatencyMs)} · {parallel.webSearchHitCount} web hits
+          </span>
+        )}
+      </div>
+      <div className="card__body">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {order.map((id) => {
+            const snap = parallel.subagents[id] ?? {
+              id,
+              status: 'queued' as const,
+              latencyMs: null,
+            }
+            const ok = snap.status === 'ok'
+            const err = snap.status === 'error'
+            const running = snap.status === 'running'
+            const liveLatency =
+              running && snap.startedAt ? now - snap.startedAt : snap.latencyMs ?? 0
+            const isOpen = open === id
+            return (
+              <div
+                key={id}
+                className={`tl__step ${ok ? 'tl__step--done' : err ? '' : running ? 'tl__step--active' : 'tl__step--pending'}`}
+              >
+                <button
+                  className="tl__head"
+                  onClick={() => setOpen(isOpen ? null : id)}
+                  aria-expanded={isOpen}
+                  style={{ background: 'transparent', border: 0, width: '100%' }}
+                >
+                  <span className="tl__num">
+                    {ok ? (
+                      <Icon name="check" size={10} />
+                    ) : err ? (
+                      <Icon name="x" size={10} />
+                    ) : running ? (
+                      <Icon name="clock" size={10} />
+                    ) : (
+                      '·'
+                    )}
+                  </span>
+                  <span className="tl__name">{SUBAGENT_LABELS[id] ?? id}</span>
+                  <span className="tl__meta mono">
+                    {liveLatency > 0 ? formatLatency(liveLatency) : ''}
+                    {snap.usage?.total_tokens ? ` · ${snap.usage.total_tokens}t` : ''}
+                    {snap.webSearchHitCount ? ` · ${snap.webSearchHitCount} web` : ''}
+                  </span>
+                  <Icon
+                    name="chevron"
+                    size={10}
+                    className={`tl__caret ${isOpen ? 'tl__caret--open' : ''}`}
+                  />
+                </button>
+                {isOpen && (
+                  <div className="tl__body">
+                    {err && (
+                      <p style={{ fontSize: 12, color: 'var(--red)', margin: 0 }}>
+                        <Icon name="alert" size={11} /> {snap.error ?? 'subagent error'}
+                      </p>
+                    )}
+                    {ok && snap.payload != null && (
+                      <JsonView data={snap.payload} maxHeight={260} />
+                    )}
+                    {running && snap.payload == null && (
+                      <p style={{ fontSize: 12, color: 'var(--muted)', margin: 0 }}>
+                        <Icon name="clock" size={11} /> waiting for GLM…
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {parallel.consolidator && (
+          <div style={{ marginTop: 12, fontSize: 11.5, color: 'var(--muted)' }}>
+            Consolidator:{' '}
+            {parallel.consolidator.status === 'running' ? (
+              <span className="kbd">running…</span>
+            ) : parallel.consolidator.status === 'ok' ? (
+              <span className="kbd">
+                ok · {formatLatency(parallel.consolidator.latencyMs ?? 0)}
+              </span>
+            ) : (
+              <span className="kbd" style={{ color: 'var(--red)' }}>
+                error: {parallel.consolidator.error ?? 'unknown'}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function RecommendedDraftCard({ parallel }: { parallel: ParallelAgentRunState }) {
+  const [explicitTab, setExplicitTab] = useState<ParallelVariantId | null>(null)
+  const winner = parallel.winner
+  // The active tab follows the consolidator's winner unless the user has
+  // explicitly clicked a different tab. We derive instead of using a setState
+  // effect so re-renders don't cascade.
+  const tab: ParallelVariantId = explicitTab ?? winner ?? 'compliance'
+  const setTab = (v: ParallelVariantId) => setExplicitTab(v)
+
+  const visibleDraft = parallel.drafts[tab]
+  const scores = parallel.evaluatorScores?.[tab]
+
+  // Show this card the moment we have any draft variant or a winner.
+  const hasAny = Object.values(parallel.drafts).some((d) => d != null) || winner != null
+  if (!hasAny) return null
+
+  const variants: ParallelVariantId[] = ['compliance', 'talent', 'speed']
+
+  return (
+    <section className="card" aria-label="Recommended draft">
+      <div className="card__head">
+        <Icon name="check" size={13} />
+        <span className="card__title">
+          Recommended draft (consolidator pick)
+        </span>
+        <span className="tb__spacer" />
+        {winner && <span className="kbd">winner: {VARIANT_LABELS[winner]}</span>}
+      </div>
+      <div className="card__body">
+        <div role="tablist" style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+          {variants.map((v) => {
+            const present = parallel.drafts[v] != null
+            const isWinner = v === winner
+            return (
+              <button
+                key={v}
+                role="tab"
+                aria-selected={tab === v}
+                className={`btn btn--sm ${tab === v ? 'btn--primary' : ''}`}
+                disabled={!present}
+                onClick={() => setTab(v)}
+                style={{ position: 'relative' }}
+              >
+                {VARIANT_LABELS[v]}
+                {isWinner && (
+                  <span
+                    className="kbd"
+                    style={{ marginLeft: 6, fontSize: 9, padding: '0 4px' }}
+                    aria-label="winner"
+                  >
+                    win
+                  </span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+        {!visibleDraft && (
+          <p style={{ fontSize: 12, color: 'var(--muted)', margin: 0 }}>
+            <Icon name="clock" size={11} /> {VARIANT_LABELS[tab]} variant not yet available.
+          </p>
+        )}
+        {visibleDraft && (
+          <>
+            <p style={{ fontSize: 12.5, margin: '0 0 8px' }}>{visibleDraft.rationale}</p>
+            {scores && (
+              <p
+                className="mono"
+                style={{ fontSize: 11.5, color: 'var(--muted)', margin: '0 0 8px' }}
+              >
+                bvf {scores.brandVoiceFit} · halluc {scores.hallucinationRisk} · icp{' '}
+                {scores.icpConfidence}
+                {scores.flagged?.length ? ` · flagged ${scores.flagged.join(',')}` : ''}
+              </p>
+            )}
+            <ol style={{ paddingLeft: 18, margin: 0, fontSize: 12 }}>
+              {visibleDraft.steps.map((s, i) => (
+                <li key={i} style={{ marginBottom: 6 }}>
+                  <span className="kbd">{s.channel}</span>{' '}
+                  <span className="mono" style={{ color: 'var(--muted)' }}>
+                    +{s.delayHours}h
+                  </span>
+                  {s.subject && <strong> · {s.subject}</strong>}
+                  <p
+                    style={{
+                      margin: '2px 0 0',
+                      whiteSpace: 'pre-wrap',
+                      color: 'var(--ink-2)',
+                    }}
+                  >
+                    {s.body}
+                  </p>
+                </li>
+              ))}
+            </ol>
+          </>
+        )}
+        {parallel.consolidator?.rationale && (
+          <p style={{ fontSize: 11.5, color: 'var(--muted)', margin: '10px 0 0' }}>
+            <Icon name="info" size={11} /> Consolidator rationale: {parallel.consolidator.rationale}
+          </p>
+        )}
+      </div>
+    </section>
   )
 }
 
