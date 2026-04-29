@@ -453,10 +453,13 @@ export default async (req) => {
       ]
 
       // Fire all 4 in parallel. Each emits its own subagent event the moment
-      // it lands. Promise.allSettled-style: one failure doesn't take down the run.
-      // Per-subagent timeout (38s) bounds the worst case so the consolidator
-      // always gets to run within Netlify's 60s streaming cap.
+      // it lands. Per-subagent AbortController timeout (38s) bounds individual
+      // calls. A GLOBAL wallclock deadline (45s for subagents, leaves ~10s for
+      // the consolidator under Netlify's 60s streaming cap) guarantees the
+      // function always finalizes cleanly even if Z.ai serializes our parallel
+      // requests on the Coding Plan.
       const settled = {}
+      const SUBAGENT_DEADLINE_MS = 45000
       const promises = subagentSpecs.map((spec) =>
         runSubagent(apiKey, spec, 38000)
           .catch((err) => ({
@@ -466,6 +469,7 @@ export default async (req) => {
             error: err?.message ?? 'unknown',
           }))
           .then((result) => {
+            if (settled[spec.id]) return // already finalized by deadline
             settled[spec.id] = result
             const eventPayload = {
               id: result.id,
@@ -483,7 +487,30 @@ export default async (req) => {
             send('subagent', eventPayload)
           }),
       )
-      await Promise.all(promises)
+
+      // Race: either all subagents finish, or the global deadline forces us to
+      // close out with whatever landed.
+      const deadline = new Promise((resolve) => setTimeout(resolve, SUBAGENT_DEADLINE_MS))
+      await Promise.race([Promise.all(promises), deadline])
+
+      // For any subagent that didn't land before the deadline, emit an error
+      // event so the UI can show it timed out.
+      for (const spec of subagentSpecs) {
+        if (!settled[spec.id]) {
+          settled[spec.id] = {
+            id: spec.id,
+            status: 'error',
+            latencyMs: SUBAGENT_DEADLINE_MS,
+            error: `subagent did not return within ${SUBAGENT_DEADLINE_MS}ms wallclock deadline`,
+          }
+          send('subagent', {
+            id: spec.id,
+            status: 'error',
+            latencyMs: SUBAGENT_DEADLINE_MS,
+            error: settled[spec.id].error,
+          })
+        }
+      }
 
       const research = settled['research-enricher']
       const drafts = {
